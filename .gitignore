@@ -21,3 +21,7 @@ DerivedData/
 # Compiled binaries
 *.o
 *.swp
+
+# Claude Code files — do not commit
+CLAUDE.md
+PROGRESS.md

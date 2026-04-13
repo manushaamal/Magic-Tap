@@ -10,11 +10,20 @@ INFO_PLIST="$BUILD_DIR/$APP_NAME.app/Contents/Info.plist"
 mkdir -p "$APP_DIR"
 mkdir -p "$RESOURCES_DIR"
 
+echo "Generating app icon..."
+swift make_icon.swift
+if [ $? -ne 0 ]; then
+    echo "❌ Icon generation failed"
+    exit 1
+fi
+cp AppIcon.icns "$RESOURCES_DIR/AppIcon.icns"
+
 echo "Compiling Swift..."
-swiftc main.swift AppDelegate.swift TouchHandler.swift \
+swiftc main.swift AppDelegate.swift TouchHandler.swift LaunchAtLogin.swift \
     -framework Cocoa \
     -framework UserNotifications \
     -framework ApplicationServices \
+    -framework ServiceManagement \
     -o "$APP_DIR/$APP_NAME" \
     -target arm64-apple-macos12.0
 
@@ -36,6 +45,8 @@ cat > "$INFO_PLIST" << 'EOF'
     <string>com.local.magictap</string>
     <key>CFBundleName</key>
     <string>MagicTap</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleVersion</key>
     <string>1.0</string>
     <key>CFBundlePackageType</key>
@@ -61,5 +72,4 @@ echo ""
 echo "To run:"
 echo "  open $BUILD_DIR/$APP_NAME.app"
 echo ""
-echo "To add to Login Items:"
-echo "  System Settings → General → Login Items → add MagicTap.app"
+echo "Launch at Login can be toggled from the menu bar icon."

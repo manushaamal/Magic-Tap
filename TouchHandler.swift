@@ -124,12 +124,22 @@ class TouchHandler {
     private typealias GetFamilyIDFn     = @convention(c) (OpaquePointer, UnsafeMutablePointer<Int32>) -> Void
     private typealias RegisterCBFn      = @convention(c) (OpaquePointer, @convention(c) (OpaquePointer, UnsafeRawPointer?, Int32, Double, Int32) -> Int32) -> Void
     private typealias StartFn           = @convention(c) (OpaquePointer, Int32) -> Void
+    private typealias StopFn            = @convention(c) (OpaquePointer) -> Void
+
+    private var registeredDevices: [OpaquePointer] = []
+    private var stopDevice: StopFn?
 
     func start() {
         guard isAccessibilityGranted() else {
             DispatchQueue.main.async { self.promptAccessibility() }
             return
         }
+        loadAndRegister()
+    }
+
+    func restart() {
+        stopExistingDevices()
+        gActiveTouches.removeAll()
         loadAndRegister()
     }
 
@@ -161,6 +171,14 @@ class TouchHandler {
         NSApp.terminate(nil)
     }
 
+    private func stopExistingDevices() {
+        guard let stop = stopDevice else { return }
+        for dev in registeredDevices {
+            stop(dev)
+        }
+        registeredDevices.removeAll()
+    }
+
     private func loadAndRegister() {
         let path = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
         guard let lib = dlopen(path, RTLD_NOW) else { return }
@@ -169,13 +187,15 @@ class TouchHandler {
             let s1 = dlsym(lib, "MTDeviceCreateList"),
             let s2 = dlsym(lib, "MTDeviceGetFamilyID"),
             let s3 = dlsym(lib, "MTRegisterContactFrameCallback"),
-            let s4 = dlsym(lib, "MTDeviceStart")
+            let s4 = dlsym(lib, "MTDeviceStart"),
+            let s5 = dlsym(lib, "MTDeviceStop")
         else { return }
 
         let createList  = unsafeBitCast(s1, to: CreateListFn.self)
         let getFamilyID = unsafeBitCast(s2, to: GetFamilyIDFn.self)
         let registerCB  = unsafeBitCast(s3, to: RegisterCBFn.self)
         let startDevice = unsafeBitCast(s4, to: StartFn.self)
+        stopDevice      = unsafeBitCast(s5, to: StopFn.self)
 
         guard let devices = createList() else { return }
 
@@ -187,6 +207,7 @@ class TouchHandler {
                 let cb: @convention(c) (OpaquePointer, UnsafeRawPointer?, Int32, Double, Int32) -> Int32 = mtTouchCallback
                 registerCB(dev, cb)
                 startDevice(dev, 0)
+                registeredDevices.append(dev)
             }
         }
     }
