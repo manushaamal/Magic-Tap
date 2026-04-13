@@ -97,10 +97,34 @@ func mtTouchCallback(
 
 // MARK: - Synthetic click injection
 
+// Global state for click-count tracking (must be global — called from C callback chain)
+private var gLastClickTime:     Double   = 0
+private var gLastClickPoint:    CGPoint  = .zero
+private var gLastClickCount:    Int64    = 0
+private var gLastClickWasRight: Bool     = false
+
 private func postSyntheticClick(isRight: Bool) {
     let mousePos = NSEvent.mouseLocation
     let screenH  = NSScreen.main?.frame.height ?? 0
     let pt = CGPoint(x: mousePos.x, y: screenH - mousePos.y)
+
+    // Compute click count so macOS apps see real double/triple-clicks.
+    // Two taps qualify if they're within the system double-click interval,
+    // within 4 pt of each other, and on the same button.
+    let now      = Date().timeIntervalSinceReferenceDate
+    let elapsed  = now - gLastClickTime
+    let moved    = hypot(pt.x - gLastClickPoint.x, pt.y - gLastClickPoint.y)
+
+    let clickCount: Int64
+    if elapsed < NSEvent.doubleClickInterval && moved < 4 && isRight == gLastClickWasRight {
+        clickCount = gLastClickCount + 1
+    } else {
+        clickCount = 1
+    }
+    gLastClickTime     = now
+    gLastClickPoint    = pt
+    gLastClickCount    = clickCount
+    gLastClickWasRight = isRight
 
     let downType: CGEventType   = isRight ? .rightMouseDown : .leftMouseDown
     let upType:   CGEventType   = isRight ? .rightMouseUp   : .leftMouseUp
@@ -110,6 +134,9 @@ private func postSyntheticClick(isRight: Bool) {
         let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pt, mouseButton: button),
         let up   = CGEvent(mouseEventSource: nil, mouseType: upType,   mouseCursorPosition: pt, mouseButton: button)
     else { return }
+
+    down.setIntegerValueField(.mouseEventClickState, value: clickCount)
+    up.setIntegerValueField(.mouseEventClickState, value: clickCount)
 
     down.post(tap: .cghidEventTap)
     up.post(tap: .cghidEventTap)
@@ -139,6 +166,10 @@ class TouchHandler {
     // Persistent device list — kept alive like Jitouch does (DO NOT let it go out of scope)
     private var deviceList: CFMutableArray?
 
+    // Retry state — used when no devices are found at startup (e.g. login item timing)
+    private var retryCount = 0
+    private let maxRetries = 5
+
     // MARK: - Public API
 
     func start() {
@@ -149,6 +180,7 @@ class TouchHandler {
     // Called on NSWorkspace.didWakeNotification.
     // Mirrors Jitouch's -reload: unregister + stop all → 1 s pause → fresh list + re-register.
     func restart() {
+        retryCount = 0
         unregisterAndStop()
         gActiveTouches.removeAll()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
@@ -200,16 +232,19 @@ class TouchHandler {
 
     // Build a fresh device list and register callbacks.
     // Mirrors Jitouch reload phase 2: MTDeviceCreateList → MTRegisterContactFrameCallback → MTDeviceStart.
+    // If no Magic Mouse is found (e.g. system not ready at login), retries up to maxRetries times.
     private func registerDevices() {
         guard let create    = createList,
               let getFamily = getFamilyID,
               let reg       = registerCB,
               let start     = startDevice else { return }
 
-        guard let freshList = create() else { return }
-        deviceList = freshList   // retain via Swift ARC; kept alive until next unregisterAndStop()
+        guard let freshList = create() else {
+            scheduleRetry(); return
+        }
 
         let cb: MTCb = mtTouchCallback
+        var found = 0
         for i in 0..<CFArrayGetCount(freshList) {
             let dev = unsafeBitCast(CFArrayGetValueAtIndex(freshList, i), to: OpaquePointer.self)
             var familyID: Int32 = 0
@@ -217,7 +252,23 @@ class TouchHandler {
             if familyID == 112 {   // Magic Mouse & Magic Mouse 2
                 reg(dev, cb)
                 start(dev, 0)
+                found += 1
             }
+        }
+
+        if found > 0 {
+            deviceList = freshList   // keep alive; released in unregisterAndStop()
+            retryCount = 0
+        } else {
+            scheduleRetry()
+        }
+    }
+
+    private func scheduleRetry() {
+        guard retryCount < maxRetries else { return }
+        retryCount += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
+            self.registerDevices()
         }
     }
 }
