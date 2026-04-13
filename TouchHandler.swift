@@ -102,9 +102,9 @@ private func postSyntheticClick(isRight: Bool) {
     let screenH  = NSScreen.main?.frame.height ?? 0
     let pt = CGPoint(x: mousePos.x, y: screenH - mousePos.y)
 
-    let downType: CGEventType  = isRight ? .rightMouseDown  : .leftMouseDown
-    let upType:   CGEventType  = isRight ? .rightMouseUp    : .leftMouseUp
-    let button:   CGMouseButton = isRight ? .right           : .left
+    let downType: CGEventType   = isRight ? .rightMouseDown : .leftMouseDown
+    let upType:   CGEventType   = isRight ? .rightMouseUp   : .leftMouseUp
+    let button:   CGMouseButton = isRight ? .right          : .left
 
     guard
         let down = CGEvent(mouseEventSource: nil, mouseType: downType, mouseCursorPosition: pt, mouseButton: button),
@@ -120,34 +120,51 @@ private func postSyntheticClick(isRight: Bool) {
 class TouchHandler {
     static let shared = TouchHandler()
 
-    private typealias CreateListFn      = @convention(c) () -> CFMutableArray?
-    private typealias GetFamilyIDFn     = @convention(c) (OpaquePointer, UnsafeMutablePointer<Int32>) -> Void
-    private typealias RegisterCBFn      = @convention(c) (OpaquePointer, @convention(c) (OpaquePointer, UnsafeRawPointer?, Int32, Double, Int32) -> Int32) -> Void
-    private typealias StartFn           = @convention(c) (OpaquePointer, Int32) -> Void
-    private typealias StopFn            = @convention(c) (OpaquePointer) -> Void
+    // C function pointer types
+    private typealias MTCb          = @convention(c) (OpaquePointer, UnsafeRawPointer?, Int32, Double, Int32) -> Int32
+    private typealias CreateListFn  = @convention(c) () -> CFMutableArray?
+    private typealias GetFamilyIDFn = @convention(c) (OpaquePointer, UnsafeMutablePointer<Int32>) -> Void
+    private typealias CBFn          = @convention(c) (OpaquePointer, MTCb) -> Void   // register & unregister share this signature
+    private typealias StartFn       = @convention(c) (OpaquePointer, Int32) -> Void
+    private typealias StopFn        = @convention(c) (OpaquePointer) -> Void
 
-    private var registeredDevices: [OpaquePointer] = []
-    private var stopDevice: StopFn?
+    // Library and function pointers — loaded once at startup
+    private var createList:   CreateListFn?
+    private var getFamilyID:  GetFamilyIDFn?
+    private var registerCB:   CBFn?
+    private var unregisterCB: CBFn?
+    private var startDevice:  StartFn?
+    private var stopDevice:   StopFn?
+
+    // Persistent device list — kept alive like Jitouch does (DO NOT let it go out of scope)
+    private var deviceList: CFMutableArray?
+
+    // MARK: - Public API
 
     func start() {
         guard isAccessibilityGranted() else {
             DispatchQueue.main.async { self.promptAccessibility() }
             return
         }
-        loadAndRegister()
+        loadLibrary()
+        registerDevices()
     }
 
+    // Called on NSWorkspace.didWakeNotification.
+    // Mirrors Jitouch's -reload: unregister + stop all → 1 s pause → fresh list + re-register.
     func restart() {
-        stopExistingDevices()
+        unregisterAndStop()
         gActiveTouches.removeAll()
-        loadAndRegister()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            self.registerDevices()
+        }
     }
 
     func setEnabled(_ enabled: Bool) {
         gTapEnabled = enabled
     }
 
-    // MARK: Private
+    // MARK: - Private
 
     private func isAccessibilityGranted() -> Bool {
         AXIsProcessTrustedWithOptions(nil)
@@ -171,43 +188,61 @@ class TouchHandler {
         NSApp.terminate(nil)
     }
 
-    private func stopExistingDevices() {
-        guard let stop = stopDevice else { return }
-        for dev in registeredDevices {
-            stop(dev)
-        }
-        registeredDevices.removeAll()
-    }
-
-    private func loadAndRegister() {
+    // Load the private framework once; store all function pointers.
+    private func loadLibrary() {
         let path = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
-        guard let lib = dlopen(path, RTLD_NOW) else { return }
-
-        guard
-            let s1 = dlsym(lib, "MTDeviceCreateList"),
-            let s2 = dlsym(lib, "MTDeviceGetFamilyID"),
-            let s3 = dlsym(lib, "MTRegisterContactFrameCallback"),
-            let s4 = dlsym(lib, "MTDeviceStart"),
-            let s5 = dlsym(lib, "MTDeviceStop")
+        guard let lib = dlopen(path, RTLD_NOW),
+              let s1 = dlsym(lib, "MTDeviceCreateList"),
+              let s2 = dlsym(lib, "MTDeviceGetFamilyID"),
+              let s3 = dlsym(lib, "MTRegisterContactFrameCallback"),
+              let s4 = dlsym(lib, "MTUnregisterContactFrameCallback"),
+              let s5 = dlsym(lib, "MTDeviceStart"),
+              let s6 = dlsym(lib, "MTDeviceStop")
         else { return }
 
-        let createList  = unsafeBitCast(s1, to: CreateListFn.self)
-        let getFamilyID = unsafeBitCast(s2, to: GetFamilyIDFn.self)
-        let registerCB  = unsafeBitCast(s3, to: RegisterCBFn.self)
-        let startDevice = unsafeBitCast(s4, to: StartFn.self)
-        stopDevice      = unsafeBitCast(s5, to: StopFn.self)
+        createList   = unsafeBitCast(s1, to: CreateListFn.self)
+        getFamilyID  = unsafeBitCast(s2, to: GetFamilyIDFn.self)
+        registerCB   = unsafeBitCast(s3, to: CBFn.self)
+        unregisterCB = unsafeBitCast(s4, to: CBFn.self)
+        startDevice  = unsafeBitCast(s5, to: StartFn.self)
+        stopDevice   = unsafeBitCast(s6, to: StopFn.self)
+    }
 
-        guard let devices = createList() else { return }
+    // Unregister callback then stop every tracked device, then release the list.
+    // Mirrors Jitouch reload phase 1: MTUnregisterContactFrameCallback → MTDeviceStop → CFRelease(deviceList).
+    private func unregisterAndStop() {
+        guard let list  = deviceList,
+              let unreg = unregisterCB,
+              let stop  = stopDevice else { return }
 
-        for i in 0..<CFArrayGetCount(devices) {
-            let dev = unsafeBitCast(CFArrayGetValueAtIndex(devices, i), to: OpaquePointer.self)
+        let cb: MTCb = mtTouchCallback
+        for i in 0..<CFArrayGetCount(list) {
+            let dev = unsafeBitCast(CFArrayGetValueAtIndex(list, i), to: OpaquePointer.self)
+            unreg(dev, cb)
+            stop(dev)
+        }
+        deviceList = nil   // releases the CFMutableArray (Swift ARC handles CFRelease)
+    }
+
+    // Build a fresh device list and register callbacks.
+    // Mirrors Jitouch reload phase 2: MTDeviceCreateList → MTRegisterContactFrameCallback → MTDeviceStart.
+    private func registerDevices() {
+        guard let create    = createList,
+              let getFamily = getFamilyID,
+              let reg       = registerCB,
+              let start     = startDevice else { return }
+
+        guard let freshList = create() else { return }
+        deviceList = freshList   // retain via Swift ARC; kept alive until next unregisterAndStop()
+
+        let cb: MTCb = mtTouchCallback
+        for i in 0..<CFArrayGetCount(freshList) {
+            let dev = unsafeBitCast(CFArrayGetValueAtIndex(freshList, i), to: OpaquePointer.self)
             var familyID: Int32 = 0
-            getFamilyID(dev, &familyID)
-            if familyID == 112 { // Magic Mouse & Magic Mouse 2
-                let cb: @convention(c) (OpaquePointer, UnsafeRawPointer?, Int32, Double, Int32) -> Int32 = mtTouchCallback
-                registerCB(dev, cb)
-                startDevice(dev, 0)
-                registeredDevices.append(dev)
+            getFamily(dev, &familyID)
+            if familyID == 112 {   // Magic Mouse & Magic Mouse 2
+                reg(dev, cb)
+                start(dev, 0)
             }
         }
     }
