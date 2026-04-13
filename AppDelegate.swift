@@ -1,16 +1,16 @@
 import Cocoa
-import UserNotifications
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var tapEnabled: Bool = true
     private var launchAtLoginItem: NSMenuItem!
+    private var permissionTimer: Timer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateIcon()
         buildMenu()
-        TouchHandler.shared.start()
+        checkAccessibilityAndStart()
 
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
@@ -24,6 +24,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard tapEnabled else { return }
         TouchHandler.shared.restart()
     }
+
+    // MARK: - Accessibility permission
+
+    // Checks permission, triggers the system prompt if needed, and polls until granted.
+    // No custom alert — the macOS system dialog is sufficient.
+    private func checkAccessibilityAndStart() {
+        if AXIsProcessTrustedWithOptions(nil) {
+            TouchHandler.shared.start()
+            return
+        }
+
+        // Show the native macOS accessibility prompt
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        AXIsProcessTrustedWithOptions(opts)
+
+        // Poll every 2 s until permission is granted, then start
+        permissionTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] timer in
+            if AXIsProcessTrustedWithOptions(nil) {
+                timer.invalidate()
+                self?.permissionTimer = nil
+                TouchHandler.shared.start()
+            }
+        }
+    }
+
+    // MARK: - Menu
 
     private func buildMenu() {
         let menu = NSMenu()

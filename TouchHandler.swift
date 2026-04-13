@@ -142,10 +142,6 @@ class TouchHandler {
     // MARK: - Public API
 
     func start() {
-        guard isAccessibilityGranted() else {
-            DispatchQueue.main.async { self.promptAccessibility() }
-            return
-        }
         loadLibrary()
         registerDevices()
     }
@@ -165,28 +161,6 @@ class TouchHandler {
     }
 
     // MARK: - Private
-
-    private func isAccessibilityGranted() -> Bool {
-        AXIsProcessTrustedWithOptions(nil)
-    }
-
-    private func promptAccessibility() {
-        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        AXIsProcessTrustedWithOptions(opts)
-
-        let alert = NSAlert()
-        alert.messageText = "Accessibility Permission Required"
-        alert.informativeText = "MagicTap needs Accessibility access to inject tap events.\n\nGo to System Settings → Privacy & Security → Accessibility and enable MagicTap, then relaunch the app."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Open Settings")
-        alert.addButton(withTitle: "Quit")
-        NSApp.activate(ignoringOtherApps: true)
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
-        }
-        NSApp.terminate(nil)
-    }
 
     // Load the private framework once; store all function pointers.
     private func loadLibrary() {
